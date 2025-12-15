@@ -39,7 +39,53 @@ from dotenv import load_dotenv
 
 
 def get_repos(org_name, headers):
-    """Fetch all repositories for the given organization."""
+    """
+    Fetch all repositories for a specified GitHub organization.
+
+    Retrieves the complete list of repositories in a GitHub organization using
+    pagination to handle organizations with large numbers of repositories.
+    Includes comprehensive error handling for rate limits, permission issues,
+    and invalid organization names.
+
+    Parameters
+    ----------
+    org_name : str
+        The name of the GitHub organization to fetch repositories from.
+    headers : dict
+        Dictionary containing HTTP headers for GitHub API authentication.
+        Must include 'Authorization' key with valid GitHub token.
+
+    Returns
+    -------
+    list of dict
+        List of repository objects returned by the GitHub API. Each repository
+        object contains metadata such as name, owner, URL, and other attributes.
+        Returns empty list if organization has no repositories.
+
+    Raises
+    ------
+    ValueError
+        If the GitHub API rate limit is exceeded (403 with rate limit message).
+        If access is denied due to invalid token, insufficient permissions,
+        incorrect organization name, or lack of access to the organization.
+        If any other HTTP error occurs (non-200 status code).
+
+    Notes
+    -----
+    This function uses the GitHub REST API v3 endpoint:
+    GET /orgs/{org}/repos
+
+    The function automatically handles pagination, fetching all repositories
+    across multiple pages if necessary. Progress is printed to console during
+    execution.
+
+    Examples
+    --------
+    >>> headers = {'Authorization': 'token ghp_xxx'}
+    >>> repos = get_repos('microsoft', headers)
+    >>> len(repos)
+    1234
+    """
     repos = []
     page = 1
     print(f"\nFetching repositories for {org_name}...")
@@ -81,7 +127,48 @@ def get_repos(org_name, headers):
     return repos
 
 def get_organization_members(org_name, headers):
-    """Fetch all members of the organization."""
+    """
+    Fetch all members of a specified GitHub organization.
+
+    Retrieves the complete list of members in a GitHub organization using
+    pagination to handle organizations with large membership counts. Member
+    information is returned as a set of login usernames for efficient lookup
+    operations.
+
+    Parameters
+    ----------
+    org_name : str
+        The name of the GitHub organization to fetch members from.
+    headers : dict
+        Dictionary containing HTTP headers for GitHub API authentication.
+        Must include 'Authorization' key with valid GitHub token.
+
+    Returns
+    -------
+    set of str
+        Set containing the GitHub login usernames of all organization members.
+        Returns empty set if the organization has no members or if an error
+        occurs during API communication.
+
+    Notes
+    -----
+    This function uses the GitHub REST API v3 endpoint:
+    GET /orgs/{org}/members
+
+    The function automatically handles pagination to retrieve all members
+    across multiple pages. Unlike get_repos(), this function silently handles
+    errors (returns partial results on error) rather than raising exceptions.
+
+    The token used must have 'read:org' scope to access organization membership
+    information.
+
+    Examples
+    --------
+    >>> headers = {'Authorization': 'token ghp_xxx'}
+    >>> members = get_organization_members('microsoft', headers)
+    >>> 'octocat' in members
+    True
+    """
     members = []
     page = 1
     while True:
@@ -99,6 +186,82 @@ def get_organization_members(org_name, headers):
     return {member['login'] for member in members}
 
 def get_contributors(org_name, number_of_days, headers, interesting_repos=None):
+    """
+    Analyze and retrieve contributor activity across organization repositories.
+
+    This is the main analysis engine that processes commits across all (or filtered)
+    repositories in an organization within a specified time period. It tracks both
+    commit author names and GitHub usernames, providing detailed per-repository
+    statistics and aggregate contributor information.
+
+    Parameters
+    ----------
+    org_name : str
+        The name of the GitHub organization to analyze.
+    number_of_days : int
+        Number of days in the past to analyze commit history. The function will
+        analyze commits from (current_date - number_of_days) to current_date.
+    headers : dict
+        Dictionary containing HTTP headers for GitHub API authentication.
+        Must include 'Authorization' key with valid GitHub token.
+    interesting_repos : set of str, optional
+        Optional set of repository names to filter analysis. If provided, only
+        repositories matching these names (case-insensitive) will be analyzed.
+        If None (default), all repositories in the organization are analyzed.
+
+    Returns
+    -------
+    unique_contributors : set of str
+        Set of unique commit author names found across all analyzed repositories.
+        These are extracted from commit metadata and may not correspond to GitHub
+        usernames.
+    unique_authors : set of str
+        Set of unique GitHub login usernames who authored commits in the analyzed
+        repositories. These are GitHub account usernames.
+    repos_detail : dict
+        Dictionary mapping repository names to detailed statistics. Each entry
+        contains:
+        - 'repository_url' : str - HTML URL of the repository
+        - 'total_commits' : int - Total number of commits in the time period
+        - 'unique_contributors_count' : int - Number of unique commit authors
+        - 'unique_github_authors_count' : int - Number of unique GitHub usernames
+        - 'commit_authors' : dict - Mapping of author names to commit counts
+        - 'github_authors' : dict - Mapping of GitHub usernames to commit counts
+
+    Notes
+    -----
+    This function uses timezone-aware datetime calculations (UTC) to ensure
+    accurate date range filtering regardless of local timezone.
+
+    The distinction between 'contributors' and 'authors':
+    - Contributors: Names from commit metadata (commit.author.name)
+    - Authors: GitHub usernames (commit.author.login)
+    These may differ due to git configuration vs GitHub account names.
+
+    When interesting_repos filter is active, the function provides detailed
+    reporting about matching/missing repositories and warns about repositories
+    that couldn't be found.
+
+    The function uses the GitHub REST API v3 endpoint:
+    GET /repos/{owner}/{repo}/commits
+
+    Progress information is printed to console during execution.
+
+    Examples
+    --------
+    >>> headers = {'Authorization': 'token ghp_xxx'}
+    >>> contributors, authors, details = get_contributors('microsoft', 30, headers)
+    >>> len(contributors)
+    542
+    >>> 'typescript' in details
+    True
+
+    >>> # With repository filtering
+    >>> repos_filter = {'typescript', 'vscode'}
+    >>> contributors, authors, details = get_contributors('microsoft', 30, headers, repos_filter)
+    >>> len(details)
+    2
+    """
     # init contributor set
     unique_contributors = set()
     unique_authors = set()
@@ -226,6 +389,84 @@ def get_contributors(org_name, number_of_days, headers, interesting_repos=None):
     return unique_contributors, unique_authors, repos_detail
 
 def report_contributors(org_name, number_of_days, interesting_repos=None):
+    """
+    Generate a comprehensive contributor activity report for a GitHub organization.
+
+    This is the main orchestration function that coordinates the entire contributor
+    analysis workflow. It fetches organization data, analyzes contributor activity,
+    generates detailed reports, and saves results to both console and JSON file
+    format. The output includes both organization members and external contributors.
+
+    Parameters
+    ----------
+    org_name : str
+        The name of the GitHub organization to analyze.
+    number_of_days : int
+        Number of days in the past to analyze commit history. Typical values
+        are 30, 60, or 90 days.
+    interesting_repos : set of str, optional
+        Optional set of repository names to filter analysis. If provided, only
+        these repositories will be analyzed (case-insensitive matching).
+        If None (default), all repositories in the organization are analyzed.
+
+    Returns
+    -------
+    None
+        This function does not return a value. Results are output to console
+        and saved to a JSON file in the outputs/ directory.
+
+    Raises
+    ------
+    ValueError
+        If GITHUB_PERSONAL_ACCESS_TOKEN environment variable is not set.
+        If API requests fail due to authentication or permission issues
+        (propagated from get_repos()).
+
+    Notes
+    -----
+    Output File Naming:
+    Files are automatically saved to outputs/ directory with the format:
+    {org_name}__{unix_timestamp}__contributor_count.json
+
+    Output Structure:
+    The JSON file contains:
+    - organization : str - Organization name
+    - date : str - Analysis date (YYYY-MM-DD)
+    - number_of_days_history : int - Lookback period
+    - org_members : list - List of organization member usernames
+    - commit_authors : list - List of GitHub usernames who committed
+    - commiting_members : list - Intersection of commit_authors and org_members
+    - repos_detail : dict - Per-repository detailed statistics
+
+    Token Requirements:
+    The GitHub Personal Access Token must have these scopes:
+    - repo (or public_repo for public repositories only)
+    - read:org
+    - read:user
+    - user:email (optional but recommended)
+
+    Console Output:
+    The function prints:
+    - Progress updates during repository and commit fetching
+    - Repository filtering information (if applicable)
+    - Final summary statistics
+    - Output file path
+
+    Examples
+    --------
+    >>> # Analyze all repositories for last 30 days
+    >>> report_contributors('microsoft', 30)
+
+    >>> # Analyze specific repositories for last 90 days
+    >>> repos = {'typescript', 'vscode', 'vscode-python'}
+    >>> report_contributors('microsoft', 90, repos)
+
+    See Also
+    --------
+    get_repos : Fetches repository list
+    get_organization_members : Fetches member list
+    get_contributors : Core analysis function
+    """
     # init github auth
     token = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN")
     if not token:
